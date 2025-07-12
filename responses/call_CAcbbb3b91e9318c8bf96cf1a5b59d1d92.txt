@@ -1,0 +1,10 @@
+Call SID: CAcbbb3b91e9318c8bf96cf1a5b59d1d92
+Timestamp: 2025-07-12T15:00:46.740913
+Question: name
+Response: Alexandra
+--------------------------------------------------
+Call SID: CAcbbb3b91e9318c8bf96cf1a5b59d1d92
+Timestamp: 2025-07-12T15:00:54.038395
+Question: reason
+Response: Book a flight ticket
+--------------------------------------------------

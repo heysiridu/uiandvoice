@@ -8,9 +8,9 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from livekit import api, rtc
-from deepgram import Deepgram
+from deepgram import DeepgramClient as Deepgram
 import google.generativeai as genai
-from elevenlabs import AsyncElevenLabs
+import elevenlabs
 from pydantic import BaseModel
 
 # Configure logging
@@ -34,7 +34,10 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  
 # Initialize API clients
 deepgram_client = Deepgram(DEEPGRAM_API_KEY) if DEEPGRAM_API_KEY else None
 genai.configure(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-elevenlabs_client = AsyncElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
+# Set API key for elevenlabs
+if ELEVENLABS_API_KEY:
+    elevenlabs.set_api_key(ELEVENLABS_API_KEY)
+elevenlabs_client = ELEVENLABS_API_KEY is not None
 
 
 class ConversationState(BaseModel):
@@ -83,34 +86,27 @@ async def handle_incoming_call(request: Request):
         
         logger.info(f"Incoming call from {from_number} with SID: {call_sid}")
         
-        # Create a unique room name for this call
-        room_name = f"call-{call_sid}"
-        
-        # Create LiveKit room for this call
-        livekit_token = await create_livekit_token(room_name, call_sid)
-        
-        # Initialize conversation state
-        conversation = ConversationState(
-            call_sid=call_sid,
-            room_name=room_name,
-            start_time=datetime.now()
-        )
-        active_conversations[call_sid] = conversation
-        
-        # Create TwiML response to connect call to LiveKit
+        # Create a TwiML response with speech recognition
         response = VoiceResponse()
-        connect = Connect()
-        connect.stream(
-            url=f"{LIVEKIT_URL}/twilio",
-            parameters={
-                "roomName": room_name,
-                "token": livekit_token
-            }
-        )
-        response.append(connect)
         
-        # Start the conversation handler asynchronously
-        asyncio.create_task(handle_conversation(conversation))
+        # Add a greeting
+        response.say("Hello! Welcome to our voice assistant. I'm here to help you today.")
+        
+        # Add a pause
+        response.pause(length=1)
+        
+        # Ask for name with speech recognition
+        gather = response.gather(
+            input='speech',
+            timeout=10,
+            speech_timeout='auto',
+            action='/twilio/name_response',
+            method='POST'
+        )
+        gather.say("What's your name?")
+        
+        # If no response, redirect to ask again
+        response.redirect('/twilio/voice')
         
         return Response(content=str(response), media_type="application/xml")
         
@@ -119,6 +115,85 @@ async def handle_incoming_call(request: Request):
         response = VoiceResponse()
         response.say("Sorry, we're experiencing technical difficulties. Please try again later.")
         response.hangup()
+        return Response(content=str(response), media_type="application/xml")
+
+
+@app.post("/twilio/name_response")
+async def handle_name_response(request: Request):
+    """Handle the name response from the user"""
+    try:
+        form_data = await request.form()
+        call_sid = form_data.get("CallSid", "")
+        speech_result = form_data.get("SpeechResult", "")
+        confidence = form_data.get("Confidence", "")
+        
+        logger.info(f"Name response for call {call_sid}: {speech_result} (confidence: {confidence})")
+        
+        # Save the name to a file
+        if speech_result:
+            # Clean up the speech result (remove trailing punctuation)
+            cleaned_result = speech_result.strip().rstrip('.!?')
+            await save_response_to_file(call_sid, "name", cleaned_result)
+        
+        # Create response for the second question
+        response = VoiceResponse()
+        
+        # Ask for reason with speech recognition
+        gather = response.gather(
+            input='speech',
+            timeout=10,
+            speech_timeout='auto',
+            action='/twilio/reason_response',
+            method='POST'
+        )
+        gather.say("Why are you calling today?")
+        
+        # If no response, ask again
+        response.say("I didn't hear your response. Let me ask again.")
+        response.redirect('/twilio/name_response')
+        
+        return Response(content=str(response), media_type="application/xml")
+        
+    except Exception as e:
+        logger.error(f"Error handling name response: {e}")
+        response = VoiceResponse()
+        response.say("I'm sorry, I didn't catch that. Let me ask again.")
+        response.redirect('/twilio/voice')
+        return Response(content=str(response), media_type="application/xml")
+
+
+@app.post("/twilio/reason_response")
+async def handle_reason_response(request: Request):
+    """Handle the reason response from the user"""
+    try:
+        form_data = await request.form()
+        call_sid = form_data.get("CallSid", "")
+        speech_result = form_data.get("SpeechResult", "")
+        confidence = form_data.get("Confidence", "")
+        
+        logger.info(f"Reason response for call {call_sid}: {speech_result} (confidence: {confidence})")
+        
+        # Save the reason to a file
+        if speech_result:
+            # Clean up the speech result (remove trailing punctuation)
+            cleaned_result = speech_result.strip().rstrip('.!?')
+            await save_response_to_file(call_sid, "reason", cleaned_result)
+        
+        # Create final response
+        response = VoiceResponse()
+        response.say("Thank you for calling! Have a great day.")
+        response.hangup()
+        
+        # Create a summary of the call
+        await create_call_summary(call_sid)
+        
+        return Response(content=str(response), media_type="application/xml")
+        
+    except Exception as e:
+        logger.error(f"Error handling reason response: {e}")
+        response = VoiceResponse()
+        response.say("I'm sorry, I didn't catch that. Let me ask again.")
+        response.redirect('/twilio/reason_response')
         return Response(content=str(response), media_type="application/xml")
 
 
@@ -142,6 +217,56 @@ async def handle_call_status(request: Request):
         logger.error(f"Error handling call status: {e}")
     
     return PlainTextResponse("OK")
+
+
+async def save_response_to_file(call_sid: str, question_type: str, response_text: str):
+    """Save user responses to a text file"""
+    try:
+        # Create responses directory if it doesn't exist
+        os.makedirs("responses", exist_ok=True)
+        
+        # Create filename based on call_sid only (no timestamp)
+        filename = f"responses/call_{call_sid}.txt"
+        
+        # Append the response to file
+        with open(filename, "a") as f:
+            f.write(f"Call SID: {call_sid}\n")
+            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+            f.write(f"Question: {question_type}\n")
+            f.write(f"Response: {response_text}\n")
+            f.write("-" * 50 + "\n")
+        
+        logger.info(f"Saved {question_type} response to {filename}")
+        
+    except Exception as e:
+        logger.error(f"Error saving response to file: {e}")
+
+
+async def create_call_summary(call_sid: str):
+    """Create a summary file for the completed call"""
+    try:
+        filename = f"responses/call_{call_sid}.txt"
+        
+        if os.path.exists(filename):
+            # Read the existing file
+            with open(filename, "r") as f:
+                content = f.read()
+            
+            # Create a summary file
+            summary_filename = f"responses/call_{call_sid}_summary.txt"
+            with open(summary_filename, "w") as f:
+                f.write("=== CALL SUMMARY ===\n")
+                f.write(f"Call SID: {call_sid}\n")
+                f.write(f"Call Completed: {datetime.now().isoformat()}\n")
+                f.write("=" * 50 + "\n\n")
+                f.write("=== ALL RESPONSES ===\n")
+                f.write(content)
+                f.write("\n=== END OF CALL ===\n")
+            
+            logger.info(f"Created call summary: {summary_filename}")
+        
+    except Exception as e:
+        logger.error(f"Error creating call summary: {e}")
 
 
 async def create_livekit_token(room_name: str, participant_name: str) -> str:
@@ -305,21 +430,17 @@ async def generate_gemini_response(conversation: ConversationState, user_input: 
 async def send_tts_response(room_name: str, text: str):
     """Convert text to speech using ElevenLabs and send to LiveKit room"""
     try:
-        if not elevenlabs_client:
-            logger.error("ElevenLabs client not initialized")
+        if not ELEVENLABS_API_KEY:
+            logger.error("ElevenLabs API key not configured")
             return
             
         logger.info(f"Generating TTS for: {text}")
         
         # Generate audio using ElevenLabs
-        audio_stream = await elevenlabs_client.text_to_speech.convert(
+        audio_stream = await elevenlabs.generate(
             text=text,
-            voice_id=ELEVENLABS_VOICE_ID,
-            model_id="eleven_monolingual_v1",
-            voice_settings={
-                "stability": 0.5,
-                "similarity_boost": 0.5
-            }
+            voice=ELEVENLABS_VOICE_ID,
+            model="eleven_monolingual_v1"
         )
         
         # TODO: Send audio to LiveKit room
