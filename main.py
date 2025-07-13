@@ -35,7 +35,7 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Default voice
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "9BWtsMINqrJLrRacOk9x")  # Default voice
 
 # Audio recording configuration
 DEFAULT_AUDIO_FORMAT = os.getenv("DEFAULT_AUDIO_FORMAT", "mp3")
